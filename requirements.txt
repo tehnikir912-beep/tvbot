@@ -1,5 +1,5 @@
 aiogram
-aiosqlite
 aiohttp
 python-dotenv
 tzdata
+libsql-experimental
