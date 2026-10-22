@@ -320,11 +320,31 @@ async def fetch_and_store_epg():
             programmes_count = 0
 
             async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-                await db.execute("DELETE FROM programmes")
-                await db.execute("DELETE FROM channels")
+                # 1. Создаем временные таблицы
+                await db.execute("DROP TABLE IF EXISTS channels_tmp")
+                await db.execute("DROP TABLE IF EXISTS programmes_tmp")
+                
+                await db.execute("""
+                    CREATE TABLE channels_tmp (
+                        channel_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        name_lower TEXT NOT NULL
+                    )
+                """)
+                await db.execute("""
+                    CREATE TABLE programmes_tmp (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        channel_id TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        description TEXT,
+                        start_time INTEGER NOT NULL,
+                        stop_time INTEGER
+                    )
+                """)
                 await db.commit()
 
                 batch = []
+                # 2. Пишем в временные таблицы
                 for _, elem in ET.iterparse(source_path, events=("end",)):
                     if elem.tag == "channel":
                         channel_id = elem.attrib.get("id", "")
@@ -335,7 +355,7 @@ async def fetch_and_store_epg():
                         if channel_id and names:
                             name = names[0]
                             await db.execute(
-                                "INSERT OR REPLACE INTO channels (channel_id, name, name_lower) VALUES (?, ?, ?)",
+                                "INSERT INTO channels_tmp (channel_id, name, name_lower) VALUES (?, ?, ?)",
                                 (channel_id, name, name.lower()),
                             )
                             channels_count += 1
@@ -350,7 +370,7 @@ async def fetch_and_store_epg():
                             batch.append((channel_id, title, description, start, stop))
                         if len(batch) >= 2000:
                             await db.executemany(
-                                "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
+                                "INSERT INTO programmes_tmp (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
                                 batch,
                             )
                             programmes_count += len(batch)
@@ -359,11 +379,22 @@ async def fetch_and_store_epg():
 
                 if batch:
                     await db.executemany(
-                        "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO programmes_tmp (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
                         batch,
                     )
                     programmes_count += len(batch)
 
+                # 3. Безшовная замена (миллисекунды)
+                await db.execute("DROP TABLE IF EXISTS channels")
+                await db.execute("DROP TABLE IF EXISTS programmes")
+                await db.execute("ALTER TABLE channels_tmp RENAME TO channels")
+                await db.execute("ALTER TABLE programmes_tmp RENAME TO programmes")
+                
+                # 4. Восстанавливаем индексы
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_channels_lower ON channels(name_lower)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_programme_start ON programmes(start_time)")
+                await db.execute("CREATE INDEX IF NOT EXISTS idx_programme_channel ON programmes(channel_id)")
+                
                 await db.commit()
 
             if os.path.exists(source_path):
