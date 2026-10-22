@@ -2,6 +2,7 @@ import asyncio
 import gzip
 import io
 import os
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -290,65 +291,106 @@ def date_start_ts(target_date, tz):
 
 async def fetch_and_store_epg():
     timeout = aiohttp.ClientTimeout(total=300)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(EPG_URL) as response:
-            response.raise_for_status()
-            data = await response.read()
+    
+    # Скачиваем во временный файл, чтобы не забивать память
+    temp_fd, temp_path = tempfile.mkstemp()
+    os.close(temp_fd)
+    
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(EPG_URL) as response:
+                response.raise_for_status()
+                with open(temp_path, "wb") as f:
+                    async for chunk in response.content.iter_chunked(65536):
+                        f.write(chunk)
 
-    if data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
+        # Проверяем, сжат ли файл (по первым байтам)
+        with open(temp_path, "rb") as f:
+            header = f.read(2)
+            
+        if header == b"\x1f\x8b":
+            # Распаковываем на диск, а не в память
+            decomp_path = temp_path + ".xml"
+            with gzip.open(temp_path, "rb") as f_in, open(decomp_path, "wb") as f_out:
+                while True:
+                    chunk = f_in.read(65536)
+                    if not chunk:
+                        break
+                    f_out.write(chunk)
+            os.remove(temp_path)
+            source_path = decomp_path
+        else:
+            source_path = temp_path
 
-    channels_count = 0
-    programmes_count = 0
+        channels_count = 0
+        programmes_count = 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM programmes")
-        await db.execute("DELETE FROM channels")
-        await db.commit()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM programmes")
+            await db.execute("DELETE FROM channels")
+            await db.commit()
 
-        batch = []
-        for _, elem in ET.iterparse(io.BytesIO(data), events=("end",)):
-            if elem.tag == "channel":
-                channel_id = elem.attrib.get("id", "")
-                names = [
-                    c.text.strip() for c in elem
-                    if c.tag == "display-name" and c.text and c.text.strip()
-                ]
-                if channel_id and names:
-                    name = names[0]
-                    await db.execute(
-                        "INSERT OR REPLACE INTO channels (channel_id, name, name_lower) VALUES (?, ?, ?)",
-                        (channel_id, name, name.lower()),
-                    )
-                    channels_count += 1
-                elem.clear()
-            elif elem.tag == "programme":
-                channel_id = elem.attrib.get("channel", "")
-                title = next((c.text.strip() for c in elem if c.tag == "title" and c.text and c.text.strip()), "")
-                description = next((c.text.strip() for c in elem if c.tag == "desc" and c.text and c.text.strip()), "")
-                start = xmltv_time(elem.attrib.get("start", ""))
-                stop = xmltv_time(elem.attrib.get("stop", ""))
-                if channel_id and title and start:
-                    batch.append((channel_id, title, description, start, stop))
-                if len(batch) >= 2000:
-                    await db.executemany(
-                        "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
-                        batch,
-                    )
-                    programmes_count += len(batch)
-                    batch.clear()
-                elem.clear()
+            batch = []
+            # Читаем из файла на диске
+            for _, elem in ET.iterparse(source_path, events=("end",)):
+                if elem.tag == "channel":
+                    channel_id = elem.attrib.get("id", "")
+                    names = [
+                        c.text.strip() for c in elem
+                        if c.tag == "display-name" and c.text and c.text.strip()
+                    ]
+                    if channel_id and names:
+                        name = names[0]
+                        await db.execute(
+                            "INSERT OR REPLACE INTO channels (channel_id, name, name_lower) VALUES (?, ?, ?)",
+                            (channel_id, name, name.lower()),
+                        )
+                        channels_count += 1
+                    elem.clear()
+                elif elem.tag == "programme":
+                    channel_id = elem.attrib.get("channel", "")
+                    title = next((c.text.strip() for c in elem if c.tag == "title" and c.text and c.text.strip()), "")
+                    description = next((c.text.strip() for c in elem if c.tag == "desc" and c.text and c.text.strip()), "")
+                    start = xmltv_time(elem.attrib.get("start", ""))
+                    stop = xmltv_time(elem.attrib.get("stop", ""))
+                    if channel_id and title and start:
+                        batch.append((channel_id, title, description, start, stop))
+                    if len(batch) >= 2000:
+                        await db.executemany(
+                            "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
+                            batch,
+                        )
+                        programmes_count += len(batch)
+                        batch.clear()
+                    elem.clear()
 
-        if batch:
-            await db.executemany(
-                "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
-                batch,
-            )
-            programmes_count += len(batch)
+            if batch:
+                await db.executemany(
+                    "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
+                    batch,
+                )
+                programmes_count += len(batch)
 
-        await db.commit()
+            await db.commit()
 
-    return channels_count, programmes_count
+        if os.path.exists(source_path):
+            os.remove(source_path)
+
+        return channels_count, programmes_count
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise e
+
+
+async def initial_epg_load():
+    print("[startup] loading EPG in background...")
+    try:
+        cc, pc = await fetch_and_store_epg()
+        await set_meta("last_epg_update", int(time.time()))
+        print(f"[startup] Done: {cc} ch, {pc} prog")
+    except Exception as e:
+        print(f"[startup] EPG error: {e}")
 
 
 async def epg_updater_loop():
@@ -1531,7 +1573,6 @@ async def main():
     await init_db()
     bot = Bot(token=TOKEN)
 
-    # --- Мини-сервер для Render Web Service ---
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app)
@@ -1540,7 +1581,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"Web server started on port {port}")
-    # -----------------------------------------
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM channels")
@@ -1548,13 +1588,7 @@ async def main():
         channels_exist = row[0] > 0 if row else False
 
     if not channels_exist:
-        print("[startup] loading EPG...")
-        try:
-            cc, pc = await fetch_and_store_epg()
-            await set_meta("last_epg_update", int(time.time()))
-            print(f"[startup] {cc} ch, {pc} prog")
-        except Exception as e:
-            print(f"[startup] {e}")
+        asyncio.create_task(initial_epg_load())
 
     _epg_task = asyncio.create_task(epg_updater_loop())
     _reminder_task = asyncio.create_task(reminder_loop(bot))
@@ -1574,4 +1608,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
