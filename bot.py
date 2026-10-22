@@ -7,10 +7,11 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
+import contextlib
 
 import aiohttp
 from aiohttp import web
-import aiosqlite
+import libsql_experimental as libsql
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
@@ -35,16 +36,17 @@ except Exception:
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "tvbot.db"
+DB_URL = os.getenv("TURSO_DATABASE_URL")
+DB_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 EPG_URL = "http://epg.one/ru.xml.gz"
 SCHEDULE_LIMIT = 12
-EPG_UPDATE_INTERVAL = 24 * 3600  # 24 часа
+EPG_UPDATE_INTERVAL = 24 * 3600
 EPG_CHECK_INTERVAL = 3600
 REMINDER_TICK = 30
 SCHEMA_VERSION = 4
 
-if not TOKEN:
-    raise ValueError("Не найден BOT_TOKEN в файле .env")
+if not TOKEN or not DB_URL or not DB_TOKEN:
+    raise ValueError("Не хватает переменных окружения (BOT_TOKEN, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)")
 
 TIMEZONES = [
     ("Europe/Minsk", "Минск (UTC+3)", 3),
@@ -68,7 +70,6 @@ TIMEZONES = [
 _TZ_OFFSETS = {name: offset for name, _, offset in TIMEZONES}
 _WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
-
 def get_tz_by_name(tz_name):
     if _ZONEINFO_AVAILABLE and tz_name:
         try:
@@ -78,9 +79,7 @@ def get_tz_by_name(tz_name):
     offset = _TZ_OFFSETS.get(tz_name, 3)
     return timezone(timedelta(hours=offset))
 
-
 DEFAULT_TZ = get_tz_by_name("Europe/Minsk")
-
 dp = Dispatcher()
 search_modes = {}
 last_context = {}
@@ -92,30 +91,21 @@ _epg_lock = asyncio.Lock()
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📡 Найти канал")],
-        [
-            KeyboardButton(text="📺 Мои каналы"),
-            KeyboardButton(text="🕐 Сейчас и далее"),
-        ],
-        [
-            KeyboardButton(text="⭐ Избранные передачи"),
-            KeyboardButton(text="⏰ Мои напоминания"),
-        ],
+        [KeyboardButton(text="📺 Мои каналы"), KeyboardButton(text="🕐 Сейчас и далее")],
+        [KeyboardButton(text="⭐ Избранные передачи"), KeyboardButton(text="⏰ Мои напоминания")],
         [KeyboardButton(text="⚙️ Настройки")],
     ],
     resize_keyboard=True,
 )
 
-
 def esc(text):
     return html_escape(text or "")
-
 
 def shorten(text, max_len):
     text = text or ""
     if len(text) <= max_len:
         return text
     return text[: max_len - 1].rstrip() + "…"
-
 
 async def safe_edit(message, text, kb):
     try:
@@ -126,10 +116,17 @@ async def safe_edit(message, text, kb):
     except Exception as e:
         print(f"[edit] {type(e).__name__}: {e}")
 
+# --- Подключение к Turso ---
+@contextlib.asynccontextmanager
+async def get_db():
+    db = await libsql.connect(database=DB_URL, auth_token=DB_TOKEN)
+    try:
+        yield db
+    finally:
+        await db.close()
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
+    async with get_db() as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -210,40 +207,34 @@ async def init_db():
         )
         await db.commit()
 
-
 async def get_meta(key):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
-
 async def set_meta(key, value):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
         await db.commit()
 
-
 async def get_user_tz_name(user_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
     return row[0] if row and row[0] else "Europe/Minsk"
-
 
 async def get_user_tz(user_id):
     name = await get_user_tz_name(user_id)
     return get_tz_by_name(name)
 
-
 async def set_user_tz(user_id, tz_name):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT OR REPLACE INTO users (user_id, timezone) VALUES (?, ?)",
             (user_id, tz_name),
         )
         await db.commit()
-
 
 def xmltv_time(value):
     if not value:
@@ -258,12 +249,10 @@ def xmltv_time(value):
     except ValueError:
         return None
 
-
 def local_time(timestamp, tz=None):
     if not timestamp:
         return "?"
     return datetime.fromtimestamp(timestamp, tz or DEFAULT_TZ).strftime("%d.%m %H:%M")
-
 
 def short_time(timestamp, now=None, tz=None):
     if not timestamp:
@@ -277,18 +266,15 @@ def short_time(timestamp, now=None, tz=None):
         return dt.strftime("%H:%M")
     return dt.strftime("%d.%m %H:%M")
 
-
 def date_start_ts(target_date, tz):
     return int(datetime(
         target_date.year, target_date.month, target_date.day,
         tzinfo=tz
     ).timestamp())
 
-
 async def fetch_and_store_epg():
     async with _epg_lock:
         timeout = aiohttp.ClientTimeout(total=300)
-        
         temp_fd, temp_path = tempfile.mkstemp()
         os.close(temp_fd)
         
@@ -319,7 +305,7 @@ async def fetch_and_store_epg():
             channels_count = 0
             programmes_count = 0
 
-            async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with get_db() as db:
                 await db.execute("DELETE FROM programmes")
                 await db.execute("DELETE FROM channels")
                 await db.commit()
@@ -375,7 +361,6 @@ async def fetch_and_store_epg():
                 os.remove(temp_path)
             raise e
 
-
 async def initial_epg_load():
     print("[startup] loading EPG in background...")
     try:
@@ -384,7 +369,6 @@ async def initial_epg_load():
         print(f"[startup] Done: {cc} ch, {pc} prog")
     except Exception as e:
         print(f"[startup] EPG error: {e}")
-
 
 async def epg_updater_loop():
     while True:
@@ -399,12 +383,11 @@ async def epg_updater_loop():
             print(f"[EPG] {e}")
         await asyncio.sleep(EPG_CHECK_INTERVAL)
 
-
 async def reminder_loop(bot: Bot):
     while True:
         try:
             now = int(time.time())
-            async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            async with get_db() as db:
                 cursor = await db.execute(
                     """
                     SELECT pf.id, pf.user_id, pf.channel_id, pf.title, pf.start_time,
@@ -421,7 +404,6 @@ async def reminder_loop(bot: Bot):
 
                 for fav_id, user_id, channel_id, title, start, minutes, repeat_mode in rows:
                     tz = await get_user_tz(user_id)
-
                     c2 = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
                     ch_row = await c2.fetchone()
                     ch_name = ch_row[0] if ch_row else "?"
@@ -484,26 +466,23 @@ async def reminder_loop(bot: Bot):
             print(f"[reminder_loop] {e}")
         await asyncio.sleep(REMINDER_TICK)
 
-
 async def search_channels(query):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             "SELECT channel_id, name FROM channels WHERE name_lower LIKE ? ORDER BY name LIMIT 15",
             (f"%{query.lower()}%",),
         )
         return await cursor.fetchall()
 
-
 async def get_channel_name(channel_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
         row = await cursor.fetchone()
         return row[0] if row else None
 
-
 async def get_channel_dates(channel_id, tz):
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             "SELECT start_time FROM programmes "
             "WHERE channel_id = ? AND (stop_time IS NULL OR stop_time >= ?) "
@@ -522,14 +501,13 @@ async def get_channel_dates(channel_id, tz):
             dates.add(d)
     return sorted(dates)
 
-
 async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
     start_ts = date_start_ts(target_date, tz)
     end_ts = date_start_ts(target_date + timedelta(days=1), tz)
     now = int(time.time())
     today = datetime.fromtimestamp(now, tz).date()
 
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         if target_date == today:
             cursor = await db.execute(
                 """
@@ -559,19 +537,17 @@ async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
             )
         return await cursor.fetchall()
 
-
 async def get_program(programme_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             "SELECT id, channel_id, title, description, start_time, stop_time FROM programmes WHERE id = ?",
             (programme_id,),
         )
         return await cursor.fetchone()
 
-
 async def get_current_and_next(channel_id):
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cur = await db.execute(
             "SELECT id, title, start_time, stop_time FROM programmes "
             "WHERE channel_id = ? AND start_time <= ? AND (stop_time IS NULL OR stop_time >= ?) "
@@ -589,27 +565,23 @@ async def get_current_and_next(channel_id):
         next_prog = await nxt.fetchone()
         return current, next_prog
 
-
 async def add_my_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute("INSERT OR IGNORE INTO favorites (user_id, channel_id) VALUES (?, ?)", (user_id, channel_id))
         await db.commit()
 
-
 async def remove_my_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
         await db.commit()
 
-
 async def is_my_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute("SELECT 1 FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
         return await cursor.fetchone() is not None
 
-
 async def get_my_channels(user_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             """
             SELECT f.channel_id, c.name FROM favorites f
@@ -620,9 +592,8 @@ async def get_my_channels(user_id):
         )
         return await cursor.fetchall()
 
-
 async def add_program_favorite(user_id, channel_id, title, start_time, description):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             "INSERT OR IGNORE INTO program_favorites (user_id, channel_id, title, start_time, description) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -631,25 +602,22 @@ async def add_program_favorite(user_id, channel_id, title, start_time, descripti
         await db.commit()
         return cursor.rowcount > 0
 
-
 async def remove_program_favorite_by_id(fav_id, user_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute("DELETE FROM program_favorites WHERE id = ? AND user_id = ?", (fav_id, user_id))
         await db.commit()
 
-
 async def get_favorite_program_by_attrs(user_id, channel_id, title, start_time):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cur = await db.execute(
             "SELECT id FROM program_favorites WHERE user_id=? AND channel_id=? AND title=? AND start_time=?",
             (user_id, channel_id, title, start_time)
         )
         return await cur.fetchone()
 
-
 async def get_favorite_programs_for_view(user_id):
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             """
             SELECT id, channel_id, title, start_time, reminder_minutes, repeat_mode
@@ -662,9 +630,8 @@ async def get_favorite_programs_for_view(user_id):
         )
         return await cursor.fetchall()
 
-
 async def get_favorite_program_by_id(fav_id, user_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute(
             "SELECT id, channel_id, title, start_time, description, reminder_minutes, reminder_sent, repeat_mode "
             "FROM program_favorites WHERE id = ? AND user_id = ?",
@@ -672,9 +639,8 @@ async def get_favorite_program_by_id(fav_id, user_id):
         )
         return await cursor.fetchone()
 
-
 async def set_program_reminder(fav_id, user_id, minutes, repeat_mode):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE program_favorites SET reminder_minutes = ?, repeat_mode = ?, reminder_sent = 0 "
             "WHERE id = ? AND user_id = ?",
@@ -682,25 +648,22 @@ async def set_program_reminder(fav_id, user_id, minutes, repeat_mode):
         )
         await db.commit()
 
-
 async def set_repeat_mode(fav_id, user_id, repeat_mode):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE program_favorites SET repeat_mode = ?, reminder_sent = 0 WHERE id = ? AND user_id = ?",
             (repeat_mode, fav_id, user_id),
         )
         await db.commit()
 
-
 async def clear_program_reminder(fav_id, user_id):
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE program_favorites SET reminder_minutes = NULL, repeat_mode = 'none', reminder_sent = 0 "
             "WHERE id = ? AND user_id = ?",
             (fav_id, user_id),
         )
         await db.commit()
-
 
 def _day_label(target_date, today):
     if target_date == today:
@@ -709,7 +672,6 @@ def _day_label(target_date, today):
         return f"Завтра, {target_date.strftime('%d.%m')}"
     wd = _WEEKDAYS[target_date.weekday()]
     return f"{wd}, {target_date.strftime('%d.%m')}"
-
 
 def _tab_label(target_date, today, selected):
     if target_date == today:
@@ -721,7 +683,6 @@ def _tab_label(target_date, today, selected):
     if target_date == selected:
         return f"[{base}]"
     return base
-
 
 async def build_channel_view(user_id, channel_id, date_str=None, offset=None, use_context=True):
     channel_name = await get_channel_name(channel_id) or "Неизвестный канал"
@@ -843,7 +804,6 @@ async def build_channel_view(user_id, channel_id, date_str=None, offset=None, us
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=all_rows)
 
-
 async def build_program_view(user_id, programme_id):
     row = await get_program(programme_id)
     if not row:
@@ -902,13 +862,10 @@ async def build_program_view(user_id, programme_id):
         rows.append([fav_btn])
 
     rows.append([back_btn])
-
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def _repeat_label(mode):
     return {"none": "один раз", "daily": "ежедневно", "weekly": "еженедельно"}.get(mode or "none", "один раз")
-
 
 async def build_favorite_program_view(user_id, fav_id):
     row = await get_favorite_program_by_id(fav_id, user_id)
@@ -951,7 +908,6 @@ async def build_favorite_program_view(user_id, fav_id):
     buttons.append([InlineKeyboardButton(text="🔙 К избранным передачам", callback_data="fav_prog_back")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
 async def build_reminder_menu(user_id, fav_id):
     row = await get_favorite_program_by_id(fav_id, user_id)
     if not row:
@@ -959,7 +915,6 @@ async def build_reminder_menu(user_id, fav_id):
 
     fav_id, channel_id, title, start, description, reminder_minutes, reminder_sent, repeat_mode = row
     tz = await get_user_tz(user_id)
-
     start_str = datetime.fromtimestamp(start, tz).strftime("%d.%m %H:%M")
 
     cur = "не установлено"
@@ -1008,7 +963,6 @@ async def build_reminder_menu(user_id, fav_id):
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp:{fav_id}")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 async def render_my_channels(user_id):
     channels = await get_my_channels(user_id)
     if not channels:
@@ -1016,18 +970,15 @@ async def render_my_channels(user_id):
     rows = [[InlineKeyboardButton(text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
     return "📺 <b>Мои каналы:</b>\n\nВыбери канал, чтобы увидеть расписание.", InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 async def render_now_and_next(user_id):
     channels = await get_my_channels(user_id)
     if not channels:
         return None, None
     tz = await get_user_tz(user_id)
-
     buttons = []
     for cid, name in channels:
         cur, nxt = await get_current_and_next(cid)
         ch_short = shorten(name, 16)
-
         if cur:
             pid, title, start, stop = cur
             title_short = shorten(title, 24)
@@ -1036,7 +987,6 @@ async def render_now_and_next(user_id):
                 end_str = f" (до {datetime.fromtimestamp(stop, tz).strftime('%H:%M')})"
             label = f"🔴 {ch_short} · {title_short}{end_str}"
             buttons.append([InlineKeyboardButton(text=label, callback_data=f"nnp:{pid}")])
-
         if nxt:
             nid, n_title, n_start, n_stop = nxt
             start_str = datetime.fromtimestamp(n_start, tz).strftime("%H:%M")
@@ -1049,7 +999,6 @@ async def render_now_and_next(user_id):
 
     text = "🕐 <b>Сейчас и далее</b>\n\n<i>Тапни на передачу — увидишь описание.</i>"
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 async def render_favorite_programs(user_id):
     favs = await get_favorite_programs_for_view(user_id)
@@ -1070,7 +1019,6 @@ async def render_favorite_programs(user_id):
             callback_data=f"fp:{fav_id}",
         )])
     return "⭐ <b>Избранные передачи:</b>", InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 async def render_my_reminders(user_id):
     favs = await get_favorite_programs_for_view(user_id)
@@ -1093,11 +1041,9 @@ async def render_my_reminders(user_id):
         return None, None
     return "⏰ <b>Мои напоминания:</b>", InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 async def render_settings(user_id):
     tz_name = await get_user_tz_name(user_id)
     label = next((lbl for key, lbl, _ in TIMEZONES if key == tz_name), tz_name)
-
     note = ""
     if not _ZONEINFO_AVAILABLE:
         note = "\n⚠️ <i>Пакет zoneinfo недоступен — используется упрощённое смещение. Установи: pip install tzdata</i>"
@@ -1122,12 +1068,10 @@ async def render_settings(user_id):
         rows.append(pair)
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def channels_keyboard(channels):
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
     )
-
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -1146,7 +1090,6 @@ async def start_handler(message: Message):
         reply_markup=keyboard,
     )
 
-
 @dp.message(F.text == "/updateepg")
 async def update_handler(message: Message):
     await message.answer("📥 Обновляю EPG вручную...")
@@ -1158,7 +1101,6 @@ async def update_handler(message: Message):
         await message.answer(f"❌ Ошибка: {type(e).__name__}")
         print(f"[manual EPG] {e}")
 
-
 @dp.message(F.text == "/cancel")
 async def cancel_handler(message: Message):
     search_modes.pop(message.from_user.id, None)
@@ -1166,13 +1108,11 @@ async def cancel_handler(message: Message):
     last_channel_view.pop(message.from_user.id, None)
     await message.answer("Ок, отменил.")
 
-
 @dp.message(F.text == "📡 Найти канал")
 async def find_channel_handler(message: Message):
     search_modes[message.from_user.id] = "channel"
     last_context.pop(message.from_user.id, None)
     await message.answer("📡 Введи название канала (можно частями):\nнапример: Беларусь, ОНТ, НТВ")
-
 
 @dp.message(F.text == "📺 Мои каналы")
 async def my_channels_handler(message: Message):
@@ -1188,7 +1128,6 @@ async def my_channels_handler(message: Message):
         return
     last_context[user_id] = {"type": "mine"}
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
 
 @dp.message(F.text == "🕐 Сейчас и далее")
 async def now_and_next_handler(message: Message):
@@ -1208,7 +1147,6 @@ async def now_and_next_handler(message: Message):
     else:
         await message.answer(text, parse_mode="HTML")
 
-
 @dp.message(F.text == "⭐ Избранные передачи")
 async def favorite_programs_handler(message: Message):
     search_modes.pop(message.from_user.id, None)
@@ -1222,7 +1160,6 @@ async def favorite_programs_handler(message: Message):
         )
         return
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
 
 @dp.message(F.text == "⏰ Мои напоминания")
 async def my_reminders_handler(message: Message):
@@ -1238,13 +1175,11 @@ async def my_reminders_handler(message: Message):
         return
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-
 @dp.message(F.text == "⚙️ Настройки")
 async def settings_handler(message: Message):
     search_modes.pop(message.from_user.id, None)
     text, kb = await render_settings(message.from_user.id)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
 
 @dp.callback_query(F.data.startswith("oc:"))
 async def open_channel_handler(callback: CallbackQuery):
@@ -1252,7 +1187,6 @@ async def open_channel_handler(callback: CallbackQuery):
     text, kb = await build_channel_view(callback.from_user.id, channel_id, use_context=False)
     await safe_edit(callback.message, text, kb)
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("ocd:"))
 async def open_channel_day_handler(callback: CallbackQuery):
@@ -1270,7 +1204,6 @@ async def open_channel_day_handler(callback: CallbackQuery):
     await safe_edit(callback.message, text, kb)
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("fac:"))
 async def channel_add_handler(callback: CallbackQuery):
     channel_id = callback.data[4:]
@@ -1279,7 +1212,6 @@ async def channel_add_handler(callback: CallbackQuery):
     await safe_edit(callback.message, text, kb)
     await callback.answer("📺 Канал добавлен")
 
-
 @dp.callback_query(F.data.startswith("fdc:"))
 async def channel_remove_handler(callback: CallbackQuery):
     channel_id = callback.data[4:]
@@ -1287,7 +1219,6 @@ async def channel_remove_handler(callback: CallbackQuery):
     text, kb = await build_channel_view(callback.from_user.id, channel_id)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Убран из моих каналов")
-
 
 @dp.callback_query(F.data.startswith("p:"))
 async def open_program_handler(callback: CallbackQuery):
@@ -1299,7 +1230,6 @@ async def open_program_handler(callback: CallbackQuery):
     await safe_edit(callback.message, text, kb)
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("nnp:"))
 async def open_program_from_now_next(callback: CallbackQuery):
     pid = int(callback.data[4:])
@@ -1309,7 +1239,6 @@ async def open_program_from_now_next(callback: CallbackQuery):
         return
     await safe_edit(callback.message, text, kb)
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("pfa:"))
 async def program_fav_add(callback: CallbackQuery):
@@ -1324,7 +1253,6 @@ async def program_fav_add(callback: CallbackQuery):
     text, kb = await build_program_view(callback.from_user.id, pid)
     if kb:
         await safe_edit(callback.message, text, kb)
-
 
 @dp.callback_query(F.data.startswith("pfd:"))
 async def program_fav_del(callback: CallbackQuery):
@@ -1342,7 +1270,6 @@ async def program_fav_del(callback: CallbackQuery):
     if kb:
         await safe_edit(callback.message, text, kb)
 
-
 @dp.callback_query(F.data.startswith("fp:"))
 async def open_fav_program_handler(callback: CallbackQuery):
     fav_id = int(callback.data[3:])
@@ -1352,7 +1279,6 @@ async def open_fav_program_handler(callback: CallbackQuery):
         return
     await safe_edit(callback.message, text, kb)
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("fpr:"))
 async def fav_program_remove(callback: CallbackQuery):
@@ -1365,7 +1291,6 @@ async def fav_program_remove(callback: CallbackQuery):
     else:
         await safe_edit(callback.message, text, kb)
 
-
 @dp.callback_query(F.data == "fav_prog_back")
 async def fav_prog_back_handler(callback: CallbackQuery):
     text, kb = await render_favorite_programs(callback.from_user.id)
@@ -1374,7 +1299,6 @@ async def fav_prog_back_handler(callback: CallbackQuery):
     else:
         await safe_edit(callback.message, text, kb)
     await callback.answer()
-
 
 @dp.callback_query(F.data.startswith("fprem:"))
 async def open_reminder_menu(callback: CallbackQuery):
@@ -1393,13 +1317,11 @@ async def open_reminder_menu(callback: CallbackQuery):
     await safe_edit(callback.message, text, kb)
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("fprem_set:"))
 async def set_reminder_handler(callback: CallbackQuery):
     parts = callback.data.split(":")
     fav_id = int(parts[1])
     minutes = int(parts[2])
-
     row = await get_favorite_program_by_id(fav_id, callback.from_user.id)
     if not row:
         await callback.answer("Не найдено", show_alert=True)
@@ -1417,7 +1339,6 @@ async def set_reminder_handler(callback: CallbackQuery):
             show_alert=True,
         )
         return
-
     if minutes >= 1440 and current_repeat != "none":
         current_repeat = "none"
         await callback.answer("Повтор отключён (за 1 день только разово)")
@@ -1428,13 +1349,11 @@ async def set_reminder_handler(callback: CallbackQuery):
     text, kb = await build_reminder_menu(callback.from_user.id, fav_id)
     await safe_edit(callback.message, text, kb)
 
-
 @dp.callback_query(F.data.startswith("fprem_rep:"))
 async def set_repeat_handler(callback: CallbackQuery):
     parts = callback.data.split(":")
     fav_id = int(parts[1])
     mode = parts[2]
-
     row = await get_favorite_program_by_id(fav_id, callback.from_user.id)
     if not row:
         await callback.answer("Не найдено", show_alert=True)
@@ -1446,12 +1365,10 @@ async def set_repeat_handler(callback: CallbackQuery):
     if minutes >= 1440 and mode != "none":
         await callback.answer("За 1 день только разово. Смени время.", show_alert=True)
         return
-
     await set_repeat_mode(fav_id, callback.from_user.id, mode)
     text, kb = await build_reminder_menu(callback.from_user.id, fav_id)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Сохранено")
-
 
 @dp.callback_query(F.data.startswith("fprem_del:"))
 async def remove_reminder_handler(callback: CallbackQuery):
@@ -1460,7 +1377,6 @@ async def remove_reminder_handler(callback: CallbackQuery):
     text, kb = await build_favorite_program_view(callback.from_user.id, fav_id)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Напоминание отменено")
-
 
 @dp.callback_query(F.data.startswith("tz_set:"))
 async def tz_set_handler(callback: CallbackQuery):
@@ -1474,7 +1390,6 @@ async def tz_set_handler(callback: CallbackQuery):
     lbl = next((l for k, l, _ in TIMEZONES if k == tz_name), tz_name)
     await callback.answer(f"Часовой пояс: {lbl}")
 
-
 @dp.callback_query(F.data == "mine_back")
 async def mine_back_handler(callback: CallbackQuery):
     text, kb = await render_my_channels(callback.from_user.id)
@@ -1484,7 +1399,6 @@ async def mine_back_handler(callback: CallbackQuery):
         await safe_edit(callback.message, text, kb)
     await callback.answer()
 
-
 @dp.callback_query(F.data == "now_next_back")
 async def now_next_back_handler(callback: CallbackQuery):
     text, kb = await render_now_and_next(callback.from_user.id)
@@ -1493,7 +1407,6 @@ async def now_next_back_handler(callback: CallbackQuery):
     else:
         await safe_edit(callback.message, text, kb)
     await callback.answer()
-
 
 @dp.callback_query(F.data == "search_back")
 async def search_back_handler(callback: CallbackQuery):
@@ -1505,12 +1418,10 @@ async def search_back_handler(callback: CallbackQuery):
     await safe_edit(callback.message, title, channels_keyboard(channels))
     await callback.answer()
 
-
 @dp.message()
 async def message_handler(message: Message):
     if not message.text:
         return
-
     text = message.text.strip()
     user_id = message.from_user.id
     mode = search_modes.get(user_id)
@@ -1532,7 +1443,6 @@ async def message_handler(message: Message):
     last_context[user_id] = {"type": "search", "data": (title, list(results))}
     await message.answer(title, reply_markup=channels_keyboard(results), parse_mode="HTML")
 
-
 async def main():
     global _epg_task, _reminder_task
     await init_db()
@@ -1552,7 +1462,7 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     print("[startup] Webhook deleted, starting polling...")
 
-    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+    async with get_db() as db:
         cursor = await db.execute("SELECT COUNT(*) FROM channels")
         row = await cursor.fetchone()
         channels_exist = row[0] > 0 if row else False
@@ -1575,7 +1485,6 @@ async def main():
                 except asyncio.CancelledError:
                     pass
         await bot.session.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
