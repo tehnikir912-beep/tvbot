@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 
 import aiohttp
+from aiohttp import web
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
@@ -253,8 +254,7 @@ def xmltv_time(value):
         if len(value) > 14:
             dt = datetime.strptime(value[:20], "%Y%m%d%H%M%S %z")
         else:
-            dt = datetime.strptime(value[:14], "%Y%m%d%H%M%S").replace(
-                tzinfo=timezone.utc)
+            dt = datetime.strptime(value[:14], "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         return int(dt.timestamp())
     except ValueError:
         return None
@@ -324,10 +324,8 @@ async def fetch_and_store_epg():
                 elem.clear()
             elif elem.tag == "programme":
                 channel_id = elem.attrib.get("channel", "")
-                title = next((c.text.strip() for c in elem if c.tag ==
-                             "title" and c.text and c.text.strip()), "")
-                description = next(
-                    (c.text.strip() for c in elem if c.tag == "desc" and c.text and c.text.strip()), "")
+                title = next((c.text.strip() for c in elem if c.tag == "title" and c.text and c.text.strip()), "")
+                description = next((c.text.strip() for c in elem if c.tag == "desc" and c.text and c.text.strip()), "")
                 start = xmltv_time(elem.attrib.get("start", ""))
                 stop = xmltv_time(elem.attrib.get("stop", ""))
                 if channel_id and title and start:
@@ -444,8 +442,7 @@ async def reminder_loop(bot: Bot):
                                 (new_start, new_desc or "", fav_id),
                             )
                             moved_to_next = True
-                            print(
-                                f"[reminder] {fav_id} moved to next: {new_start}")
+                            print(f"[reminder] {fav_id} moved to next: {new_start}")
 
                     if not moved_to_next:
                         await db.execute("UPDATE program_favorites SET reminder_sent = 1 WHERE id = ?", (fav_id,))
@@ -720,27 +717,21 @@ async def build_channel_view(user_id, channel_id, date_str=None, offset=None, us
     today = datetime.fromtimestamp(now, tz).date()
 
     if not dates:
-        lines = [f"📺 <b>{esc(channel_name)}</b>", "",
-                 "Ближайшие передачи не найдены."]
+        lines = [f"📺 <b>{esc(channel_name)}</b>", "", "Ближайшие передачи не найдены."]
         rows = []
         in_mine = await is_my_channel(user_id, channel_id)
         if in_mine:
-            rows.append([InlineKeyboardButton(
-                text="💔 Убрать из моих каналов", callback_data=f"fdc:{channel_id}")])
+            rows.append([InlineKeyboardButton(text="💔 Убрать из моих каналов", callback_data=f"fdc:{channel_id}")])
         else:
-            rows.append([InlineKeyboardButton(
-                text="📺 Добавить в мои каналы", callback_data=f"fac:{channel_id}")])
+            rows.append([InlineKeyboardButton(text="📺 Добавить в мои каналы", callback_data=f"fac:{channel_id}")])
         ctx = last_context.get(user_id)
         if ctx:
             if ctx["type"] == "mine":
-                rows.append([InlineKeyboardButton(
-                    text="🔙 К моим каналам", callback_data="mine_back")])
+                rows.append([InlineKeyboardButton(text="🔙 К моим каналам", callback_data="mine_back")])
             elif ctx["type"] == "now_next":
-                rows.append([InlineKeyboardButton(
-                    text="🔙 К «Сейчас и далее»", callback_data="now_next_back")])
+                rows.append([InlineKeyboardButton(text="🔙 К «Сейчас и далее»", callback_data="now_next_back")])
             elif ctx["type"] == "search":
-                rows.append([InlineKeyboardButton(
-                    text="🔙 Назад", callback_data="search_back")])
+                rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="search_back")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     selected = None
@@ -752,14 +743,12 @@ async def build_channel_view(user_id, channel_id, date_str=None, offset=None, us
     if selected not in dates:
         selected = dates[0]
 
-    last_channel_view[user_id] = (
-        channel_id, selected.strftime("%Y%m%d"), offset)
+    last_channel_view[user_id] = (channel_id, selected.strftime("%Y%m%d"), offset)
 
     programmes = await get_programmes_for_date(channel_id, selected, tz, SCHEDULE_LIMIT, offset)
     if not programmes and offset > 0:
         offset = 0
-        last_channel_view[user_id] = (
-            channel_id, selected.strftime("%Y%m%d"), offset)
+        last_channel_view[user_id] = (channel_id, selected.strftime("%Y%m%d"), offset)
         programmes = await get_programmes_for_date(channel_id, selected, tz, SCHEDULE_LIMIT, 0)
 
     has_more = len(programmes) > SCHEDULE_LIMIT
@@ -814,23 +803,18 @@ async def build_channel_view(user_id, channel_id, date_str=None, offset=None, us
 
     in_mine = await is_my_channel(user_id, channel_id)
     if in_mine:
-        all_rows.append([InlineKeyboardButton(
-            text="💔 Убрать из моих каналов", callback_data=f"fdc:{channel_id}")])
+        all_rows.append([InlineKeyboardButton(text="💔 Убрать из моих каналов", callback_data=f"fdc:{channel_id}")])
     else:
-        all_rows.append([InlineKeyboardButton(
-            text="📺 Добавить в мои каналы", callback_data=f"fac:{channel_id}")])
+        all_rows.append([InlineKeyboardButton(text="📺 Добавить в мои каналы", callback_data=f"fac:{channel_id}")])
 
     ctx = last_context.get(user_id)
     if ctx:
         if ctx["type"] == "mine":
-            all_rows.append([InlineKeyboardButton(
-                text="🔙 К моим каналам", callback_data="mine_back")])
+            all_rows.append([InlineKeyboardButton(text="🔙 К моим каналам", callback_data="mine_back")])
         elif ctx["type"] == "now_next":
-            all_rows.append([InlineKeyboardButton(
-                text="🔙 К «Сейчас и далее»", callback_data="now_next_back")])
+            all_rows.append([InlineKeyboardButton(text="🔙 К «Сейчас и далее»", callback_data="now_next_back")])
         elif ctx["type"] == "search":
-            all_rows.append([InlineKeyboardButton(
-                text="🔙 Назад", callback_data="search_back")])
+            all_rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="search_back")])
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=all_rows)
 
@@ -873,27 +857,23 @@ async def build_program_view(user_id, programme_id):
 
     ctx = last_context.get(user_id)
     if ctx and ctx["type"] == "now_next":
-        back_btn = InlineKeyboardButton(
-            text="🔙 К «Сейчас и далее»", callback_data="now_next_back")
+        back_btn = InlineKeyboardButton(text="🔙 К «Сейчас и далее»", callback_data="now_next_back")
     else:
         ctx_view = last_channel_view.get(user_id)
         if ctx_view and ctx_view[0] == channel_id:
             back_cb = f"ocd:{channel_id}:{ctx_view[1]}:{ctx_view[2]}"
         else:
             back_cb = f"oc:{channel_id}"
-        back_btn = InlineKeyboardButton(
-            text="🔙 К каналу", callback_data=back_cb)
+        back_btn = InlineKeyboardButton(text="🔙 К каналу", callback_data=back_cb)
 
     rows = []
 
     if not is_live and not is_finished:
         fav_row = await get_favorite_program_by_attrs(user_id, channel_id, title, start)
         if fav_row:
-            fav_btn = InlineKeyboardButton(
-                text="💔 Убрать из избранного", callback_data=f"pfd:{pid}")
+            fav_btn = InlineKeyboardButton(text="💔 Убрать из избранного", callback_data=f"pfd:{pid}")
         else:
-            fav_btn = InlineKeyboardButton(
-                text="⭐ Добавить в избранные передачи", callback_data=f"pfa:{pid}")
+            fav_btn = InlineKeyboardButton(text="⭐ Добавить в избранные передачи", callback_data=f"pfa:{pid}")
         rows.append([fav_btn])
 
     rows.append([back_btn])
@@ -932,24 +912,18 @@ async def build_favorite_program_view(user_id, fav_id):
         lines.append("⚠️ Передача уже прошла.")
     elif reminder_minutes:
         if reminder_sent and repeat_mode == "none":
-            lines.append(
-                f"✅ Напоминание отправлено (за {reminder_minutes} мин).")
+            lines.append(f"✅ Напоминание отправлено (за {reminder_minutes} мин).")
         else:
             remind_at = start - reminder_minutes * 60
             remind_dt = datetime.fromtimestamp(remind_at, tz)
             rep = f", {_repeat_label(repeat_mode)}" if repeat_mode != "none" else ""
-            lines.append(
-                f"⏰ За {reminder_minutes} мин (в {remind_dt.strftime('%H:%M')}){rep}")
-        buttons.append([InlineKeyboardButton(
-            text="⏰ Изменить напоминание", callback_data=f"fprem:{fav_id}")])
+            lines.append(f"⏰ За {reminder_minutes} мин (в {remind_dt.strftime('%H:%M')}){rep}")
+        buttons.append([InlineKeyboardButton(text="⏰ Изменить напоминание", callback_data=f"fprem:{fav_id}")])
     else:
-        buttons.append([InlineKeyboardButton(
-            text="⏰ Установить напоминание", callback_data=f"fprem:{fav_id}")])
+        buttons.append([InlineKeyboardButton(text="⏰ Установить напоминание", callback_data=f"fprem:{fav_id}")])
 
-    buttons.append([InlineKeyboardButton(
-        text="💔 Убрать из избранного", callback_data=f"fpr:{fav_id}")])
-    buttons.append([InlineKeyboardButton(
-        text="🔙 К избранным передачам", callback_data="fav_prog_back")])
+    buttons.append([InlineKeyboardButton(text="💔 Убрать из избранного", callback_data=f"fpr:{fav_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 К избранным передачам", callback_data="fav_prog_back")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1004,11 +978,9 @@ async def build_reminder_menu(user_id, fav_id):
         rows.append(repeat_row)
 
     if reminder_minutes:
-        rows.append([InlineKeyboardButton(
-            text="🔕 Убрать напоминание", callback_data=f"fprem_del:{fav_id}")])
+        rows.append([InlineKeyboardButton(text="🔕 Убрать напоминание", callback_data=f"fprem_del:{fav_id}")])
 
-    rows.append([InlineKeyboardButton(
-        text="🔙 Назад", callback_data=f"fp:{fav_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"fp:{fav_id}")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1016,13 +988,11 @@ async def render_my_channels(user_id):
     channels = await get_my_channels(user_id)
     if not channels:
         return None, None
-    rows = [[InlineKeyboardButton(
-        text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
+    rows = [[InlineKeyboardButton(text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
     return "📺 <b>Мои каналы:</b>\n\nВыбери канал, чтобы увидеть расписание.", InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def render_now_and_next(user_id):
-    """Только кнопки с именем канала + формат «до/далее:»."""
     channels = await get_my_channels(user_id)
     if not channels:
         return None, None
@@ -1040,16 +1010,14 @@ async def render_now_and_next(user_id):
             if stop:
                 end_str = f" (до {datetime.fromtimestamp(stop, tz).strftime('%H:%M')})"
             label = f"🔴 {ch_short} · {title_short}{end_str}"
-            buttons.append([InlineKeyboardButton(
-                text=label, callback_data=f"nnp:{pid}")])
+            buttons.append([InlineKeyboardButton(text=label, callback_data=f"nnp:{pid}")])
 
         if nxt:
             nid, n_title, n_start, n_stop = nxt
             start_str = datetime.fromtimestamp(n_start, tz).strftime("%H:%M")
             title_short = shorten(n_title, 22)
             label = f"🕒 {ch_short} · далее: {title_short} в {start_str}"
-            buttons.append([InlineKeyboardButton(
-                text=label, callback_data=f"nnp:{nid}")])
+            buttons.append([InlineKeyboardButton(text=label, callback_data=f"nnp:{nid}")])
 
     if not buttons:
         return "🕐 <b>Сейчас и далее</b>\n\nНа твоих каналах нет доступных передач.", None
@@ -1121,8 +1089,7 @@ async def render_settings(user_id):
     pair = []
     for key, lbl, _ in TIMEZONES:
         mark = " ✓" if key == tz_name else ""
-        pair.append(InlineKeyboardButton(
-            text=f"{lbl}{mark}", callback_data=f"tz_set:{key}"))
+        pair.append(InlineKeyboardButton(text=f"{lbl}{mark}", callback_data=f"tz_set:{key}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
@@ -1133,8 +1100,7 @@ async def render_settings(user_id):
 
 def channels_keyboard(channels):
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(
-            text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
+        inline_keyboard=[[InlineKeyboardButton(text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
     )
 
 
@@ -1564,6 +1530,17 @@ async def main():
     global _epg_task, _reminder_task
     await init_db()
     bot = Bot(token=TOKEN)
+
+    # --- Мини-сервер для Render Web Service ---
+    app = web.Application()
+    app.router.add_get('/', lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+    # -----------------------------------------
 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM channels")
