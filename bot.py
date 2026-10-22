@@ -38,7 +38,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "tvbot.db"
 EPG_URL = "http://epg.one/ru.xml.gz"
 SCHEDULE_LIMIT = 12
-EPG_UPDATE_INTERVAL = 24 * 3600  # <--- ИЗМЕНЕНО НА 24 ЧАСА
+EPG_UPDATE_INTERVAL = 24 * 3600  # 24 часа
 EPG_CHECK_INTERVAL = 3600
 REMINDER_TICK = 30
 SCHEMA_VERSION = 4
@@ -1516,7 +1516,7 @@ async def message_handler(message: Message):
     mode = search_modes.get(user_id)
 
     if mode != "channel":
-        await message.answer("Выбери раздел в меню.")
+        await message.answer("Выбери раздел в меню:", reply_markup=keyboard)
         return
 
     results = await search_channels(text)
