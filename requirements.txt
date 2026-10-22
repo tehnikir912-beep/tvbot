@@ -2,4 +2,4 @@ aiogram
 aiohttp
 python-dotenv
 tzdata
-libsql-experimental
+libsql
