@@ -1561,7 +1561,7 @@ async def main():
 
     try:
         print("Телегид запущен.")
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, tasks_concurrency_limit=10)
     finally:
         for t in (_epg_task, _reminder_task):
             if t:
