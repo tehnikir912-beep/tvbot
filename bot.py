@@ -326,20 +326,23 @@ async def fetch_and_store_epg():
                         stop = xmltv_time(elem.attrib.get("stop", ""))
                         if channel_id and title and start:
                             batch.append((channel_id, title, description, start, stop))
-                        if len(batch) >= 2000:
-                            await db.executemany(
-                                "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
-                                batch,
-                            )
+                        
+                        if len(batch) >= 1000: # Снизили до 1000 для надежности
+                            stmts = [
+                                ("INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)", item)
+                                for item in batch
+                            ]
+                            await db.batch(stmts)  # Правильный метод для облака
                             programmes_count += len(batch)
                             batch.clear()
                         elem.clear()
 
                 if batch:
-                    await db.executemany(
-                        "INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)",
-                        batch,
-                    )
+                    stmts = [
+                        ("INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)", item)
+                        for item in batch
+                    ]
+                    await db.batch(stmts)
                     programmes_count += len(batch)
 
             if os.path.exists(source_path):
@@ -1444,17 +1447,16 @@ async def main():
     await site.start()
     print(f"Web server started on port {port}")
 
-    print("[startup] Waiting 10s for old instance to shut down...")
-    await asyncio.sleep(10)
     await bot.delete_webhook(drop_pending_updates=True)
     print("[startup] Webhook deleted, starting polling...")
 
+    # Проверяем наличие ПЕРЕДАЧ, а не каналов
     async with get_db() as db:
-        result = await db.execute("SELECT COUNT(*) FROM channels")
+        result = await db.execute("SELECT COUNT(*) FROM programmes")
         rows = result.rows
-        channels_exist = rows[0][0] > 0 if rows else False
+        programmes_exist = rows[0][0] > 100 if rows else False
 
-    if not channels_exist:
+    if not programmes_exist:
         asyncio.create_task(initial_epg_load())
 
     _epg_task = asyncio.create_task(epg_updater_loop())
