@@ -11,7 +11,7 @@ import contextlib
 
 import aiohttp
 from aiohttp import web
-import libsql
+import libsql_client
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
@@ -118,11 +118,8 @@ async def safe_edit(message, text, kb):
 
 @contextlib.asynccontextmanager
 async def get_db():
-    db = await libsql.connect(database=DB_URL, auth_token=DB_TOKEN)
-    try:
-        yield db
-    finally:
-        await db.close()
+    async with libsql_client.create_client(url=DB_URL, auth_token=DB_TOKEN) as client:
+        yield client
 
 async def init_db():
     async with get_db() as db:
@@ -132,9 +129,9 @@ async def init_db():
                 value TEXT
             )
         """)
-        cursor = await db.execute("SELECT value FROM meta WHERE key = 'schema_version'")
-        row = await cursor.fetchone()
-        current = int(row[0]) if row else 0
+        result = await db.execute("SELECT value FROM meta WHERE key = 'schema_version'")
+        rows = result.rows
+        current = int(rows[0][0]) if rows else 0
 
         if current < 1:
             await db.execute("DROP TABLE IF EXISTS favorites")
@@ -191,8 +188,8 @@ async def init_db():
             )
         """)
 
-        cursor = await db.execute("PRAGMA table_info(program_favorites)")
-        cols = [r[1] for r in await cursor.fetchall()]
+        result = await db.execute("PRAGMA table_info(program_favorites)")
+        cols = [row[1] for row in result.rows]
         if "reminder_minutes" not in cols:
             await db.execute("ALTER TABLE program_favorites ADD COLUMN reminder_minutes INTEGER DEFAULT NULL")
         if "reminder_sent" not in cols:
@@ -204,24 +201,22 @@ async def init_db():
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
-        await db.commit()
 
 async def get_meta(key):
     async with get_db() as db:
-        cursor = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
-        row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        result = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        rows = result.rows
+        return int(rows[0][0]) if rows else 0
 
 async def set_meta(key, value):
     async with get_db() as db:
         await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
-        await db.commit()
 
 async def get_user_tz_name(user_id):
     async with get_db() as db:
-        cursor = await db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-    return row[0] if row and row[0] else "Europe/Minsk"
+        result = await db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,))
+        rows = result.rows
+    return rows[0][0] if rows and rows[0][0] else "Europe/Minsk"
 
 async def get_user_tz(user_id):
     name = await get_user_tz_name(user_id)
@@ -233,7 +228,6 @@ async def set_user_tz(user_id, tz_name):
             "INSERT OR REPLACE INTO users (user_id, timezone) VALUES (?, ?)",
             (user_id, tz_name),
         )
-        await db.commit()
 
 def xmltv_time(value):
     if not value:
@@ -307,7 +301,6 @@ async def fetch_and_store_epg():
             async with get_db() as db:
                 await db.execute("DELETE FROM programmes")
                 await db.execute("DELETE FROM channels")
-                await db.commit()
 
                 batch = []
                 for _, elem in ET.iterparse(source_path, events=("end",)):
@@ -349,8 +342,6 @@ async def fetch_and_store_epg():
                     )
                     programmes_count += len(batch)
 
-                await db.commit()
-
             if os.path.exists(source_path):
                 os.remove(source_path)
 
@@ -387,7 +378,7 @@ async def reminder_loop(bot: Bot):
         try:
             now = int(time.time())
             async with get_db() as db:
-                cursor = await db.execute(
+                result = await db.execute(
                     """
                     SELECT pf.id, pf.user_id, pf.channel_id, pf.title, pf.start_time,
                            pf.reminder_minutes, pf.repeat_mode
@@ -399,13 +390,13 @@ async def reminder_loop(bot: Bot):
                     """,
                     (now, now),
                 )
-                rows = await cursor.fetchall()
+                rows = result.rows
 
                 for fav_id, user_id, channel_id, title, start, minutes, repeat_mode in rows:
                     tz = await get_user_tz(user_id)
-                    c2 = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
-                    ch_row = await c2.fetchone()
-                    ch_name = ch_row[0] if ch_row else "?"
+                    result2 = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
+                    ch_rows = result2.rows
+                    ch_name = ch_rows[0][0] if ch_rows else "?"
 
                     remaining = start - now
                     if remaining < 60:
@@ -440,7 +431,7 @@ async def reminder_loop(bot: Bot):
                     if repeat_mode in ("daily", "weekly"):
                         min_gap = 20 * 3600 if repeat_mode == "daily" else 6 * 24 * 3600
                         threshold = start + min_gap
-                        c3 = await db.execute(
+                        result3 = await db.execute(
                             """
                             SELECT start_time, description FROM programmes
                             WHERE channel_id = ? AND title = ? AND start_time >= ?
@@ -448,9 +439,9 @@ async def reminder_loop(bot: Bot):
                             """,
                             (channel_id, title, threshold),
                         )
-                        next_row = await c3.fetchone()
-                        if next_row:
-                            new_start, new_desc = next_row
+                        next_rows = result3.rows
+                        if next_rows:
+                            new_start, new_desc = next_rows[0]
                             await db.execute(
                                 "UPDATE program_favorites SET start_time = ?, description = ?, reminder_sent = 0 WHERE id = ?",
                                 (new_start, new_desc or "", fav_id),
@@ -460,35 +451,34 @@ async def reminder_loop(bot: Bot):
 
                     if not moved_to_next:
                         await db.execute("UPDATE program_favorites SET reminder_sent = 1 WHERE id = ?", (fav_id,))
-                await db.commit()
         except Exception as e:
             print(f"[reminder_loop] {e}")
         await asyncio.sleep(REMINDER_TICK)
 
 async def search_channels(query):
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             "SELECT channel_id, name FROM channels WHERE name_lower LIKE ? ORDER BY name LIMIT 15",
             (f"%{query.lower()}%",),
         )
-        return await cursor.fetchall()
+        return result.rows
 
 async def get_channel_name(channel_id):
     async with get_db() as db:
-        cursor = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
-        row = await cursor.fetchone()
-        return row[0] if row else None
+        result = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
+        rows = result.rows
+        return rows[0][0] if rows else None
 
 async def get_channel_dates(channel_id, tz):
     now = int(time.time())
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             "SELECT start_time FROM programmes "
             "WHERE channel_id = ? AND (stop_time IS NULL OR stop_time >= ?) "
             "ORDER BY start_time",
             (channel_id, now),
         )
-        rows = await cursor.fetchall()
+        rows = result.rows
 
     today = datetime.fromtimestamp(now, tz).date()
     dates = set()
@@ -508,7 +498,7 @@ async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
 
     async with get_db() as db:
         if target_date == today:
-            cursor = await db.execute(
+            result = await db.execute(
                 """
                 SELECT id, title, description, start_time, stop_time
                 FROM programmes
@@ -521,7 +511,7 @@ async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
                 (channel_id, end_ts, now, limit + 1, offset),
             )
         else:
-            cursor = await db.execute(
+            result = await db.execute(
                 """
                 SELECT id, title, description, start_time, stop_time
                 FROM programmes
@@ -534,54 +524,55 @@ async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
                 """,
                 (channel_id, start_ts, end_ts, now, limit + 1, offset),
             )
-        return await cursor.fetchall()
+        return result.rows
 
 async def get_program(programme_id):
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             "SELECT id, channel_id, title, description, start_time, stop_time FROM programmes WHERE id = ?",
             (programme_id,),
         )
-        return await cursor.fetchone()
+        rows = result.rows
+        return rows[0] if rows else None
 
 async def get_current_and_next(channel_id):
     now = int(time.time())
     async with get_db() as db:
-        cur = await db.execute(
+        result = await db.execute(
             "SELECT id, title, start_time, stop_time FROM programmes "
             "WHERE channel_id = ? AND start_time <= ? AND (stop_time IS NULL OR stop_time >= ?) "
             "ORDER BY start_time DESC LIMIT 1",
             (channel_id, now, now)
         )
-        current = await cur.fetchone()
+        current_rows = result.rows
+        current = current_rows[0] if current_rows else None
 
-        nxt = await db.execute(
+        result2 = await db.execute(
             "SELECT id, title, start_time, stop_time FROM programmes "
             "WHERE channel_id = ? AND start_time > ? "
             "ORDER BY start_time ASC LIMIT 1",
             (channel_id, now)
         )
-        next_prog = await nxt.fetchone()
+        next_rows = result2.rows
+        next_prog = next_rows[0] if next_rows else None
         return current, next_prog
 
 async def add_my_channel(user_id, channel_id):
     async with get_db() as db:
         await db.execute("INSERT OR IGNORE INTO favorites (user_id, channel_id) VALUES (?, ?)", (user_id, channel_id))
-        await db.commit()
 
 async def remove_my_channel(user_id, channel_id):
     async with get_db() as db:
         await db.execute("DELETE FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
-        await db.commit()
 
 async def is_my_channel(user_id, channel_id):
     async with get_db() as db:
-        cursor = await db.execute("SELECT 1 FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
-        return await cursor.fetchone() is not None
+        result = await db.execute("SELECT 1 FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
+        return bool(result.rows)
 
 async def get_my_channels(user_id):
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             """
             SELECT f.channel_id, c.name FROM favorites f
             JOIN channels c ON c.channel_id = f.channel_id
@@ -589,35 +580,34 @@ async def get_my_channels(user_id):
             """,
             (user_id,),
         )
-        return await cursor.fetchall()
+        return result.rows
 
 async def add_program_favorite(user_id, channel_id, title, start_time, description):
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             "INSERT OR IGNORE INTO program_favorites (user_id, channel_id, title, start_time, description) "
             "VALUES (?, ?, ?, ?, ?)",
             (user_id, channel_id, title, start_time, description or ""),
         )
-        await db.commit()
-        return cursor.rowcount > 0
+        return result.rows_affected > 0
 
 async def remove_program_favorite_by_id(fav_id, user_id):
     async with get_db() as db:
         await db.execute("DELETE FROM program_favorites WHERE id = ? AND user_id = ?", (fav_id, user_id))
-        await db.commit()
 
 async def get_favorite_program_by_attrs(user_id, channel_id, title, start_time):
     async with get_db() as db:
-        cur = await db.execute(
+        result = await db.execute(
             "SELECT id FROM program_favorites WHERE user_id=? AND channel_id=? AND title=? AND start_time=?",
             (user_id, channel_id, title, start_time)
         )
-        return await cur.fetchone()
+        rows = result.rows
+        return rows[0] if rows else None
 
 async def get_favorite_programs_for_view(user_id):
     now = int(time.time())
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             """
             SELECT id, channel_id, title, start_time, reminder_minutes, repeat_mode
             FROM program_favorites
@@ -627,16 +617,17 @@ async def get_favorite_programs_for_view(user_id):
             """,
             (user_id, now),
         )
-        return await cursor.fetchall()
+        return result.rows
 
 async def get_favorite_program_by_id(fav_id, user_id):
     async with get_db() as db:
-        cursor = await db.execute(
+        result = await db.execute(
             "SELECT id, channel_id, title, start_time, description, reminder_minutes, reminder_sent, repeat_mode "
             "FROM program_favorites WHERE id = ? AND user_id = ?",
             (fav_id, user_id),
         )
-        return await cursor.fetchone()
+        rows = result.rows
+        return rows[0] if rows else None
 
 async def set_program_reminder(fav_id, user_id, minutes, repeat_mode):
     async with get_db() as db:
@@ -645,7 +636,6 @@ async def set_program_reminder(fav_id, user_id, minutes, repeat_mode):
             "WHERE id = ? AND user_id = ?",
             (minutes, repeat_mode, fav_id, user_id),
         )
-        await db.commit()
 
 async def set_repeat_mode(fav_id, user_id, repeat_mode):
     async with get_db() as db:
@@ -653,7 +643,6 @@ async def set_repeat_mode(fav_id, user_id, repeat_mode):
             "UPDATE program_favorites SET repeat_mode = ?, reminder_sent = 0 WHERE id = ? AND user_id = ?",
             (repeat_mode, fav_id, user_id),
         )
-        await db.commit()
 
 async def clear_program_reminder(fav_id, user_id):
     async with get_db() as db:
@@ -662,7 +651,6 @@ async def clear_program_reminder(fav_id, user_id):
             "WHERE id = ? AND user_id = ?",
             (fav_id, user_id),
         )
-        await db.commit()
 
 def _day_label(target_date, today):
     if target_date == today:
@@ -1462,9 +1450,9 @@ async def main():
     print("[startup] Webhook deleted, starting polling...")
 
     async with get_db() as db:
-        cursor = await db.execute("SELECT COUNT(*) FROM channels")
-        row = await cursor.fetchone()
-        channels_exist = row[0] > 0 if row else False
+        result = await db.execute("SELECT COUNT(*) FROM channels")
+        rows = result.rows
+        channels_exist = rows[0][0] > 0 if rows else False
 
     if not channels_exist:
         asyncio.create_task(initial_epg_load())
