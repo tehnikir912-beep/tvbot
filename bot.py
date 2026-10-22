@@ -129,7 +129,10 @@ async def safe_edit(message, text, kb):
 # ---------- DB ----------
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+    # Добавляем timeout=30, чтобы база ждала окончания записи, а не падала
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+        # Включаем режим WAL (позволяет читать и писать одновременно)
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -212,20 +215,20 @@ async def init_db():
 
 
 async def get_meta(key):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
 
 async def set_meta(key, value):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
         await db.commit()
 
 
 async def get_user_tz_name(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("SELECT timezone FROM users WHERE user_id = ?", (user_id,))
         row = await cursor.fetchone()
     return row[0] if row and row[0] else "Europe/Minsk"
@@ -237,7 +240,7 @@ async def get_user_tz(user_id):
 
 
 async def set_user_tz(user_id, tz_name):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute(
             "INSERT OR REPLACE INTO users (user_id, timezone) VALUES (?, ?)",
             (user_id, tz_name),
@@ -292,7 +295,6 @@ def date_start_ts(target_date, tz):
 async def fetch_and_store_epg():
     timeout = aiohttp.ClientTimeout(total=300)
     
-    # Скачиваем во временный файл, чтобы не забивать память
     temp_fd, temp_path = tempfile.mkstemp()
     os.close(temp_fd)
     
@@ -304,12 +306,10 @@ async def fetch_and_store_epg():
                     async for chunk in response.content.iter_chunked(65536):
                         f.write(chunk)
 
-        # Проверяем, сжат ли файл (по первым байтам)
         with open(temp_path, "rb") as f:
             header = f.read(2)
             
         if header == b"\x1f\x8b":
-            # Распаковываем на диск, а не в память
             decomp_path = temp_path + ".xml"
             with gzip.open(temp_path, "rb") as f_in, open(decomp_path, "wb") as f_out:
                 while True:
@@ -325,13 +325,12 @@ async def fetch_and_store_epg():
         channels_count = 0
         programmes_count = 0
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
             await db.execute("DELETE FROM programmes")
             await db.execute("DELETE FROM channels")
             await db.commit()
 
             batch = []
-            # Читаем из файла на диске
             for _, elem in ET.iterparse(source_path, events=("end",)):
                 if elem.tag == "channel":
                     channel_id = elem.attrib.get("id", "")
@@ -386,8 +385,9 @@ async def fetch_and_store_epg():
 async def initial_epg_load():
     print("[startup] loading EPG in background...")
     try:
-        cc, pc = await fetch_and_store_epg()
+        # Сразу ставим время обновления, чтобы фоновый цикл не запустился параллельно
         await set_meta("last_epg_update", int(time.time()))
+        cc, pc = await fetch_and_store_epg()
         print(f"[startup] Done: {cc} ch, {pc} prog")
     except Exception as e:
         print(f"[startup] EPG error: {e}")
@@ -399,8 +399,8 @@ async def epg_updater_loop():
             last = await get_meta("last_epg_update")
             if int(time.time()) - last > EPG_UPDATE_INTERVAL:
                 print("[EPG] auto-update start")
-                cc, pc = await fetch_and_store_epg()
                 await set_meta("last_epg_update", int(time.time()))
+                cc, pc = await fetch_and_store_epg()
                 print(f"[EPG] done: {cc} ch, {pc} prog")
         except Exception as e:
             print(f"[EPG] {e}")
@@ -413,7 +413,7 @@ async def reminder_loop(bot: Bot):
     while True:
         try:
             now = int(time.time())
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(DB_PATH, timeout=30) as db:
                 cursor = await db.execute(
                     """
                     SELECT pf.id, pf.user_id, pf.channel_id, pf.title, pf.start_time,
@@ -497,7 +497,7 @@ async def reminder_loop(bot: Bot):
 # ---------- Запросы ----------
 
 async def search_channels(query):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             "SELECT channel_id, name FROM channels WHERE name_lower LIKE ? ORDER BY name LIMIT 15",
             (f"%{query.lower()}%",),
@@ -506,7 +506,7 @@ async def search_channels(query):
 
 
 async def get_channel_name(channel_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,))
         row = await cursor.fetchone()
         return row[0] if row else None
@@ -514,7 +514,7 @@ async def get_channel_name(channel_id):
 
 async def get_channel_dates(channel_id, tz):
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             "SELECT start_time FROM programmes "
             "WHERE channel_id = ? AND (stop_time IS NULL OR stop_time >= ?) "
@@ -540,7 +540,7 @@ async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
     now = int(time.time())
     today = datetime.fromtimestamp(now, tz).date()
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         if target_date == today:
             cursor = await db.execute(
                 """
@@ -572,7 +572,7 @@ async def get_programmes_for_date(channel_id, target_date, tz, limit, offset):
 
 
 async def get_program(programme_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             "SELECT id, channel_id, title, description, start_time, stop_time FROM programmes WHERE id = ?",
             (programme_id,),
@@ -582,7 +582,7 @@ async def get_program(programme_id):
 
 async def get_current_and_next(channel_id):
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cur = await db.execute(
             "SELECT id, title, start_time, stop_time FROM programmes "
             "WHERE channel_id = ? AND start_time <= ? AND (stop_time IS NULL OR stop_time >= ?) "
@@ -604,25 +604,25 @@ async def get_current_and_next(channel_id):
 # ---------- Мои каналы ----------
 
 async def add_my_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("INSERT OR IGNORE INTO favorites (user_id, channel_id) VALUES (?, ?)", (user_id, channel_id))
         await db.commit()
 
 
 async def remove_my_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("DELETE FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
         await db.commit()
 
 
 async def is_my_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("SELECT 1 FROM favorites WHERE user_id = ? AND channel_id = ?", (user_id, channel_id))
         return await cursor.fetchone() is not None
 
 
 async def get_my_channels(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             """
             SELECT f.channel_id, c.name FROM favorites f
@@ -637,7 +637,7 @@ async def get_my_channels(user_id):
 # ---------- Избранные передачи ----------
 
 async def add_program_favorite(user_id, channel_id, title, start_time, description):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             "INSERT OR IGNORE INTO program_favorites (user_id, channel_id, title, start_time, description) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -648,13 +648,13 @@ async def add_program_favorite(user_id, channel_id, title, start_time, descripti
 
 
 async def remove_program_favorite_by_id(fav_id, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("DELETE FROM program_favorites WHERE id = ? AND user_id = ?", (fav_id, user_id))
         await db.commit()
 
 
 async def get_favorite_program_by_attrs(user_id, channel_id, title, start_time):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cur = await db.execute(
             "SELECT id FROM program_favorites WHERE user_id=? AND channel_id=? AND title=? AND start_time=?",
             (user_id, channel_id, title, start_time)
@@ -664,7 +664,7 @@ async def get_favorite_program_by_attrs(user_id, channel_id, title, start_time):
 
 async def get_favorite_programs_for_view(user_id):
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             """
             SELECT id, channel_id, title, start_time, reminder_minutes, repeat_mode
@@ -679,7 +679,7 @@ async def get_favorite_programs_for_view(user_id):
 
 
 async def get_favorite_program_by_id(fav_id, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute(
             "SELECT id, channel_id, title, start_time, description, reminder_minutes, reminder_sent, repeat_mode "
             "FROM program_favorites WHERE id = ? AND user_id = ?",
@@ -689,7 +689,7 @@ async def get_favorite_program_by_id(fav_id, user_id):
 
 
 async def set_program_reminder(fav_id, user_id, minutes, repeat_mode):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute(
             "UPDATE program_favorites SET reminder_minutes = ?, repeat_mode = ?, reminder_sent = 0 "
             "WHERE id = ? AND user_id = ?",
@@ -699,7 +699,7 @@ async def set_program_reminder(fav_id, user_id, minutes, repeat_mode):
 
 
 async def set_repeat_mode(fav_id, user_id, repeat_mode):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute(
             "UPDATE program_favorites SET repeat_mode = ?, reminder_sent = 0 WHERE id = ? AND user_id = ?",
             (repeat_mode, fav_id, user_id),
@@ -708,7 +708,7 @@ async def set_repeat_mode(fav_id, user_id, repeat_mode):
 
 
 async def clear_program_reminder(fav_id, user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute(
             "UPDATE program_favorites SET reminder_minutes = NULL, repeat_mode = 'none', reminder_sent = 0 "
             "WHERE id = ? AND user_id = ?",
@@ -1582,7 +1582,7 @@ async def main():
     await site.start()
     print(f"Web server started on port {port}")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM channels")
         row = await cursor.fetchone()
         channels_exist = row[0] > 0 if row else False
