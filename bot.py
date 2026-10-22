@@ -87,7 +87,6 @@ last_context = {}
 last_channel_view = {}
 _epg_task = None
 _reminder_task = None
-# Замок, чтобы скачивание базы не запускалось дважды одновременно
 _epg_lock = asyncio.Lock()
 
 keyboard = ReplyKeyboardMarkup(
@@ -127,8 +126,6 @@ async def safe_edit(message, text, kb):
     except Exception as e:
         print(f"[edit] {type(e).__name__}: {e}")
 
-
-# ---------- DB ----------
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
@@ -248,8 +245,6 @@ async def set_user_tz(user_id, tz_name):
         await db.commit()
 
 
-# ---------- Утилиты ----------
-
 def xmltv_time(value):
     if not value:
         return None
@@ -289,8 +284,6 @@ def date_start_ts(target_date, tz):
         tzinfo=tz
     ).timestamp())
 
-
-# ---------- EPG ----------
 
 async def fetch_and_store_epg():
     async with _epg_lock:
@@ -407,8 +400,6 @@ async def epg_updater_loop():
         await asyncio.sleep(EPG_CHECK_INTERVAL)
 
 
-# ---------- Reminder loop ----------
-
 async def reminder_loop(bot: Bot):
     while True:
         try:
@@ -493,8 +484,6 @@ async def reminder_loop(bot: Bot):
             print(f"[reminder_loop] {e}")
         await asyncio.sleep(REMINDER_TICK)
 
-
-# ---------- Запросы ----------
 
 async def search_channels(query):
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
@@ -601,8 +590,6 @@ async def get_current_and_next(channel_id):
         return current, next_prog
 
 
-# ---------- Мои каналы ----------
-
 async def add_my_channel(user_id, channel_id):
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("INSERT OR IGNORE INTO favorites (user_id, channel_id) VALUES (?, ?)", (user_id, channel_id))
@@ -633,8 +620,6 @@ async def get_my_channels(user_id):
         )
         return await cursor.fetchall()
 
-
-# ---------- Избранные передачи ----------
 
 async def add_program_favorite(user_id, channel_id, title, start_time, description):
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
@@ -716,8 +701,6 @@ async def clear_program_reminder(fav_id, user_id):
         )
         await db.commit()
 
-
-# ---------- Виды ----------
 
 def _day_label(target_date, today):
     if target_date == today:
@@ -1146,8 +1129,6 @@ def channels_keyboard(channels):
     )
 
 
-# ---------- Хендлеры: меню ----------
-
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     search_modes.pop(message.from_user.id, None)
@@ -1265,8 +1246,6 @@ async def settings_handler(message: Message):
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-# ---------- Callbacks: канал ----------
-
 @dp.callback_query(F.data.startswith("oc:"))
 async def open_channel_handler(callback: CallbackQuery):
     channel_id = callback.data[3:]
@@ -1309,8 +1288,6 @@ async def channel_remove_handler(callback: CallbackQuery):
     await safe_edit(callback.message, text, kb)
     await callback.answer("Убран из моих каналов")
 
-
-# ---------- Callbacks: передача ----------
 
 @dp.callback_query(F.data.startswith("p:"))
 async def open_program_handler(callback: CallbackQuery):
@@ -1366,8 +1343,6 @@ async def program_fav_del(callback: CallbackQuery):
         await safe_edit(callback.message, text, kb)
 
 
-# ---------- Callbacks: избранная передача ----------
-
 @dp.callback_query(F.data.startswith("fp:"))
 async def open_fav_program_handler(callback: CallbackQuery):
     fav_id = int(callback.data[3:])
@@ -1400,8 +1375,6 @@ async def fav_prog_back_handler(callback: CallbackQuery):
         await safe_edit(callback.message, text, kb)
     await callback.answer()
 
-
-# ---------- Callbacks: напоминание ----------
 
 @dp.callback_query(F.data.startswith("fprem:"))
 async def open_reminder_menu(callback: CallbackQuery):
@@ -1489,8 +1462,6 @@ async def remove_reminder_handler(callback: CallbackQuery):
     await callback.answer("Напоминание отменено")
 
 
-# ---------- Callbacks: часовой пояс ----------
-
 @dp.callback_query(F.data.startswith("tz_set:"))
 async def tz_set_handler(callback: CallbackQuery):
     tz_name = callback.data[7:]
@@ -1503,8 +1474,6 @@ async def tz_set_handler(callback: CallbackQuery):
     lbl = next((l for k, l, _ in TIMEZONES if k == tz_name), tz_name)
     await callback.answer(f"Часовой пояс: {lbl}")
 
-
-# ---------- Навигация ----------
 
 @dp.callback_query(F.data == "mine_back")
 async def mine_back_handler(callback: CallbackQuery):
@@ -1537,8 +1506,6 @@ async def search_back_handler(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- Текстовый поиск ----------
-
 @dp.message()
 async def message_handler(message: Message):
     if not message.text:
@@ -1566,8 +1533,6 @@ async def message_handler(message: Message):
     await message.answer(title, reply_markup=channels_keyboard(results), parse_mode="HTML")
 
 
-# ---------- Запуск ----------
-
 async def main():
     global _epg_task, _reminder_task
     await init_db()
@@ -1581,6 +1546,11 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     print(f"Web server started on port {port}")
+
+    print("[startup] Waiting 10s for old instance to shut down...")
+    await asyncio.sleep(10)
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("[startup] Webhook deleted, starting polling...")
 
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("SELECT COUNT(*) FROM channels")
