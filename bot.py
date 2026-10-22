@@ -11,7 +11,7 @@ import contextlib
 
 import aiohttp
 from aiohttp import web
-import libsql_experimental as libsql
+import libsql
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
@@ -116,7 +116,6 @@ async def safe_edit(message, text, kb):
     except Exception as e:
         print(f"[edit] {type(e).__name__}: {e}")
 
-# --- Подключение к Turso ---
 @contextlib.asynccontextmanager
 async def get_db():
     db = await libsql.connect(database=DB_URL, auth_token=DB_TOKEN)
