@@ -12,9 +12,9 @@ import contextlib
 import aiohttp
 from aiohttp import web
 import libsql_client
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -22,6 +22,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    TelegramObject,
 )
 
 from dotenv import load_dotenv
@@ -38,15 +39,19 @@ load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("TURSO_DATABASE_URL")
 DB_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
+
 EPG_URL = "http://epg.one/ru.xml.gz"
 SCHEDULE_LIMIT = 12
 EPG_UPDATE_INTERVAL = 24 * 3600
 EPG_CHECK_INTERVAL = 3600
 REMINDER_TICK = 30
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
-if not TOKEN or not DB_URL or not DB_TOKEN:
-    raise ValueError("Не хватает переменных окружения (BOT_TOKEN, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)")
+if not TOKEN or not DB_URL or not DB_TOKEN or not ADMIN_ID:
+    raise ValueError("Не хватает переменных окружения (BOT_TOKEN, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, ADMIN_ID)")
+
+ADMIN_ID = int(ADMIN_ID)
 
 TIMEZONES = [
     ("Europe/Minsk", "Минск (UTC+3)", 3),
@@ -121,6 +126,31 @@ async def get_db():
     async with libsql_client.create_client(url=DB_URL, auth_token=DB_TOKEN) as client:
         yield client
 
+# ================= СТАТИСТИКА И MIDDLEWARE =================
+class UserTrackingMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        user = data.get("event_from_user")
+        if user:
+            now = int(time.time())
+            async with get_db() as db:
+                # Обновляем или добавляем пользователя
+                await db.execute(
+                    "INSERT INTO users_stats (user_id, first_seen, last_seen) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET last_seen = ?",
+                    (user.id, now, now, now)
+                )
+        return await handler(event, data)
+
+async def log_search(user_id, query):
+    if not query: return
+    now = int(time.time())
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO search_logs (user_id, query, created_at) VALUES (?, ?, ?)",
+            (user_id, query.lower(), now)
+        )
+
+# ================= БАЗА ДАННЫХ =================
 async def init_db():
     async with get_db() as db:
         await db.execute("""
@@ -180,6 +210,7 @@ async def init_db():
                     UNIQUE(user_id, channel_id, title, start_time)
                 )
             """)
+            await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '5')")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -187,6 +218,24 @@ async def init_db():
                 timezone TEXT
             )
         """)
+        
+        # Новые таблицы для статистики
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users_stats (
+                user_id INTEGER PRIMARY KEY,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS search_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_search_time ON search_logs(created_at)")
 
         result = await db.execute("PRAGMA table_info(program_favorites)")
         cols = [row[1] for row in result.rows]
@@ -197,11 +246,7 @@ async def init_db():
         if "repeat_mode" not in cols:
             await db.execute("ALTER TABLE program_favorites ADD COLUMN repeat_mode TEXT DEFAULT 'none'")
 
-        await db.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-
+# ================= ОСТАЛЬНЫЕ ФУНКЦИИ РАБОТЫ С БД =================
 async def get_meta(key):
     async with get_db() as db:
         result = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
@@ -265,6 +310,7 @@ def date_start_ts(target_date, tz):
         tzinfo=tz
     ).timestamp())
 
+# ================= EPG И НАПОМИНАНИЯ =================
 async def fetch_and_store_epg():
     async with _epg_lock:
         timeout = aiohttp.ClientTimeout(total=300)
@@ -327,12 +373,12 @@ async def fetch_and_store_epg():
                         if channel_id and title and start:
                             batch.append((channel_id, title, description, start, stop))
                         
-                        if len(batch) >= 1000: # Снизили до 1000 для надежности
+                        if len(batch) >= 1000:
                             stmts = [
                                 ("INSERT INTO programmes (channel_id, title, description, start_time, stop_time) VALUES (?, ?, ?, ?, ?)", item)
                                 for item in batch
                             ]
-                            await db.batch(stmts)  # Правильный метод для облака
+                            await db.batch(stmts)
                             programmes_count += len(batch)
                             batch.clear()
                         elem.clear()
@@ -458,6 +504,7 @@ async def reminder_loop(bot: Bot):
             print(f"[reminder_loop] {e}")
         await asyncio.sleep(REMINDER_TICK)
 
+# ================= ЗАПРОСЫ =================
 async def search_channels(query):
     async with get_db() as db:
         result = await db.execute(
@@ -655,6 +702,7 @@ async def clear_program_reminder(fav_id, user_id):
             (fav_id, user_id),
         )
 
+# ================= ФОРМИРОВАНИЕ ТЕКСТОВ =================
 def _day_label(target_date, today):
     if target_date == today:
         return f"Сегодня, {target_date.strftime('%d.%m')}"
@@ -1063,6 +1111,7 @@ def channels_keyboard(channels):
         inline_keyboard=[[InlineKeyboardButton(text=f"📺 {name}", callback_data=f"oc:{cid}")] for cid, name in channels]
     )
 
+# ================= ХЕНДЛЕРЫ =================
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     search_modes.pop(message.from_user.id, None)
@@ -1079,6 +1128,50 @@ async def start_handler(message: Message):
         "Расписание обновляется автоматически.",
         reply_markup=keyboard,
     )
+
+@dp.message(Command("stats"))
+async def stats_handler(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    now = int(time.time())
+    today_start = int(datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0).timestamp())
+    
+    async with get_db() as db:
+        # Всего пользователей
+        res_total = await db.execute("SELECT COUNT(*) FROM users_stats")
+        total_users = res_total.rows[0][0]
+        
+        # Новые сегодня
+        res_new = await db.execute("SELECT COUNT(*) FROM users_stats WHERE first_seen >= ?", (today_start,))
+        new_today = res_new.rows[0][0]
+        
+        # Активные сегодня
+        res_active = await db.execute("SELECT COUNT(*) FROM users_stats WHERE last_seen >= ?", (today_start,))
+        active_today = res_active.rows[0][0]
+        
+        # Топ запросов
+        res_top = await db.execute(
+            "SELECT query, COUNT(*) as c FROM search_logs WHERE created_at >= ? GROUP BY query ORDER BY c DESC LIMIT 5",
+            (now - 7*24*3600,)
+        )
+        top_queries = res_top.rows
+
+    text = (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"🆕 Новых сегодня: <b>{new_today}</b>\n"
+        f"⚡️ Активных сегодня: <b>{active_today}</b>\n\n"
+    )
+    
+    if top_queries:
+        text += "🔎 <b>Топ запросов (за 7 дней):</b>\n"
+        for i, (q, c) in enumerate(top_queries, 1):
+            text += f"{i}. {esc(q)} — {c} раз\n"
+    else:
+        text += "🔎 Поисков пока нет."
+
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "/updateepg")
 async def update_handler(message: Message):
@@ -1420,6 +1513,9 @@ async def message_handler(message: Message):
         await message.answer("Выбери раздел в меню:", reply_markup=keyboard)
         return
 
+    # Логируем поисковый запрос
+    await log_search(user_id, text)
+
     results = await search_channels(text)
     if not results:
         await message.answer(
@@ -1437,6 +1533,9 @@ async def main():
     global _epg_task, _reminder_task
     await init_db()
     bot = Bot(token=TOKEN)
+
+    # Подключаем middleware для сбора статистики
+    dp.update.outer_middleware(UserTrackingMiddleware())
 
     app = web.Application()
     app.router.add_get('/', lambda r: web.Response(text="OK"))
